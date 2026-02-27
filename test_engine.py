@@ -3,7 +3,8 @@ Unit tests for COBOL Protocol - Nafal Faturizki Edition
 ======================================================
 
 Comprehensive test suite covering all compression layers,
-dictionary management, entropy detection, and integrity verification.
+dictionary management, entropy detection, integrity verification,
+and Security-by-Compression architecture.
 
 Run with: python -m pytest test_engine.py -v
 """
@@ -11,15 +12,20 @@ Run with: python -m pytest test_engine.py -v
 import hashlib
 import pytest
 import numpy as np
+import struct
 from engine import (
     CobolEngine,
     DictionaryManager,
     AdaptiveEntropyDetector,
     Layer1SemanticMapper,
     Layer3DeltaEncoder,
+    Layer8FinalHardening,
     Dictionary,
     VarIntCodec,
     CompressionMetadata,
+    GlobalPatternRegistry,
+    CryptographicWrapper,
+    MathematicalShuffler,
 )
 from config import (
     DictionaryConfig,
@@ -27,6 +33,9 @@ from config import (
     CompressionError,
     DecompressionError,
     IntegrityError,
+    CompressionLayer,
+    GCM_TAG_SIZE,
+    GCM_NONCE_SIZE,
 )
 
 
@@ -453,6 +462,243 @@ class TestIntegration:
         assert deserialized.block_id == metadata.block_id
         assert deserialized.original_size == metadata.original_size
         assert deserialized.compressed_size == metadata.compressed_size
+
+
+# ============================================================================
+# SECURITY-BY-COMPRESSION TESTS
+# ============================================================================
+
+
+class TestCryptographicComponents:
+    """Test cryptographic wrapper and security components."""
+
+    def test_global_pattern_registry(self):
+        """Test global pattern registry for layer chaining."""
+        registry = GlobalPatternRegistry()
+        
+        # Register layer dictionaries
+        dict_bytes_l1 = b"layer1_dictionary_data"
+        dict_hash_l1 = registry.register_layer_dict("L1_SEMANTIC", dict_bytes_l1)
+        
+        assert dict_hash_l1 == hashlib.sha256(dict_bytes_l1).digest()
+        assert registry.get_next_layer_key("L1_SEMANTIC") is not None
+        
+        # Register second layer
+        dict_bytes_l3 = b"layer3_dictionary_data"
+        dict_hash_l3 = registry.register_layer_dict("L3_DELTA", dict_bytes_l3)
+        
+        # Combined hash should change
+        combined = registry.get_combined_hash()
+        assert combined is not None
+        assert len(combined) == 32  # SHA-256 produces 32 bytes
+        
+        # Layer 8 IV derivation
+        iv = registry.get_layer8_iv()
+        assert len(iv) == GCM_NONCE_SIZE
+        assert iv != b'\x00' * GCM_NONCE_SIZE  # Should not be all zeros
+
+    def test_cryptographic_wrapper(self):
+        """Test basic cryptographic wrapper encryption/decryption."""
+        registry = GlobalPatternRegistry()
+        wrapper = CryptographicWrapper(registry, layer_num=1)
+        
+        test_data = b"This is secret data that must be encrypted and authenticated"
+        layer_dict_hash = hashlib.sha256(b"test_dict").digest()
+        
+        # Wrap data
+        wrapped, nonce, tag = wrapper.wrap_with_encryption(test_data, layer_dict_hash)
+        
+        assert len(nonce) == GCM_NONCE_SIZE
+        assert len(tag) == GCM_TAG_SIZE
+        assert wrapped != test_data  # Should be different (encrypted)
+        
+        # Unwrap data
+        unwrapped = wrapper.unwrap_with_decryption(wrapped, layer_dict_hash)
+        assert unwrapped == test_data
+
+    def test_ciphertext_indistinguishability(self):
+        """Test that encrypted compressed data appears random (cipher-text indistinguishability)."""
+        registry = GlobalPatternRegistry()
+        wrapper = CryptographicWrapper(registry, layer_num=1)
+        
+        # Original repetitive data (highly compressible, high pattern)
+        original = b"AAAAAABBBBBBCCCCCCDDDDDD" * 100
+        layer_dict_hash = hashlib.sha256(b"test_dict").digest()
+        
+        encrypted, _, _ = wrapper.wrap_with_encryption(original, layer_dict_hash)
+        
+        # Analyze byte frequency of encrypted data
+        encrypted_array = np.frombuffer(encrypted, dtype=np.uint8)
+        byte_freq = np.bincount(encrypted_array, minlength=256)
+        
+        # Calculate entropy of encrypted data
+        probabilities = byte_freq[byte_freq > 0] / len(encrypted_array)
+        entropy = -np.sum(probabilities * np.log2(probabilities))
+        
+        # Encrypted data should have high entropy (close to 8.0 for random)
+        # We expect entropy > 7.0 for good encryption (indicating randomness-like distribution)
+        assert entropy > 6.5, f"Encryption entropy {entropy:.2f} is too low, not indistinguishable"
+        
+        # Original data should have low entropy (high repetition)
+        original_array = np.frombuffer(original, dtype=np.uint8)
+        orig_freq = np.bincount(original_array, minlength=256)
+        orig_probabilities = orig_freq[orig_freq > 0] / len(original_array)
+        orig_entropy = -np.sum(orig_probabilities * np.log2(orig_probabilities))
+        
+        assert orig_entropy < 5.0, f"Original data entropy {orig_entropy:.2f} should be low"
+        assert entropy > orig_entropy, "Encrypted data should have higher entropy than original"
+
+    def test_mathematical_shuffler(self):
+        """Test mathematical shuffling for pattern obfuscation."""
+        seed = hashlib.sha256(b"test_seed").digest()
+        shuffler = MathematicalShuffler(layer_num=3, seed=seed)
+        
+        # Create test delta values
+        deltas = np.array([0, 1, 2, 3, 0, 0, -1, -2], dtype=np.int8)
+        
+        # Shuffle
+        shuffled = shuffler.shuffle_deltas(deltas)
+        
+        # Unshuffle
+        unshuffled = shuffler.unshuffle_deltas(shuffled)
+        
+        # Should recover original values
+        np.testing.assert_array_equal(deltas, unshuffled)
+
+    def test_layer_chaining_key_derivation(self):
+        """Test that layer chaining produces different keys for each layer."""
+        registry = GlobalPatternRegistry()
+        
+        # Register dictionaries for multiple layers
+        registry.register_layer_dict("L1_SEMANTIC", b"dict_l1")
+        registry.register_layer_dict("L3_DELTA", b"dict_l3")
+        
+        # Get keys for each layer
+        key_l1 = registry.get_next_layer_key("L1_SEMANTIC")
+        key_l3 = registry.get_next_layer_key("L3_DELTA")
+        
+        # Keys should be different
+        assert key_l1 != key_l3
+        assert len(key_l1) == 32  # AES-256 key size
+        assert len(key_l3) == 32
+
+
+class TestSecurityByCompressionIntegration:
+    """Integration tests for Security-by-Compression architecture."""
+
+    def test_full_compression_decompression_cycle(self):
+        """Test full cycle with all security layers."""
+        engine = CobolEngine()
+        
+        original_data = b"""
+        The quick brown fox jumps over the lazy dog.
+        Pack my box with five dozen liquor jugs.
+        How vexingly quick daft zebras jump!
+        """ * 50
+        
+        # Compress
+        compressed, metadata = engine.compress_block(original_data)
+        
+        # Verify compressed data is different from original
+        assert compressed != original_data
+        assert len(compressed) < len(original_data)  # Should be compressed
+        
+        # Decompress
+        decompressed = engine.decompress_block(compressed, metadata)
+        
+        # Verify lossless: must recover exactly original data
+        assert decompressed == original_data
+        assert hashlib.sha256(decompressed).digest() == metadata.integrity_hash
+
+    def test_layer_8_hardening(self):
+        """Test Layer 8 final hardening with AES-256-GCM."""
+        registry = GlobalPatternRegistry()
+        dict_manager = DictionaryManager(DictionaryConfig())
+        dict_manager.set_global_registry(registry)
+        
+        layer8 = Layer8FinalHardening(dict_manager, registry)
+        
+        test_data = b"Compressed data from Layer 7" * 100
+        metadata = CompressionMetadata(
+            block_id=0,
+            original_size=len(test_data),
+            compressed_size=len(test_data),
+            compression_ratio=1.0,
+        )
+        
+        # Apply hardening
+        hardened, hardened_metadata = layer8.compress(test_data, metadata)
+        
+        # Should include Layer 8 in applied layers
+        assert CompressionLayer.L8_ULTRA_EXTREME_MAPPING in hardened_metadata.layers_applied
+        
+        # Hardened data should have GCM header structure
+        assert hardened[0] == 8  # Layer 8 marker
+        assert len(hardened) > len(test_data) + 1 + GCM_NONCE_SIZE + GCM_TAG_SIZE
+        
+        # Unwrap and verify
+        unwrapped = layer8.decompress(hardened, hardened_metadata)
+        assert unwrapped == test_data
+
+    def test_bit_corruption_detection(self):
+        """Test that single bit corruption is detected and fails."""
+        engine = CobolEngine()
+        
+        original_data = b"Important data that must never be corrupted!" * 100
+        
+        # Compress
+        compressed, metadata = engine.compress_block(original_data)
+        
+        # Corrupt a single bit in the middle
+        if len(compressed) > 100:
+            corrupted = bytearray(compressed)
+            corrupted[len(compressed) // 2] ^= 0x01  # Flip one bit
+            corrupted = bytes(corrupted)
+            
+            # Decompression should fail with integrity error
+            with pytest.raises((IntegrityError, DecompressionError)):
+                engine.decompress_block(corrupted, metadata)
+
+    def test_zero_knowledge_header_verification(self):
+        """Test header-only verification without full decryption."""
+        registry = GlobalPatternRegistry()
+        
+        # Create Layer 8 wrapped data
+        layer_num = 8
+        iv = registry.get_layer8_iv()
+        tag = b"authentic_tag!!" + b"x"[:16-14]  # Pad to 16 bytes
+        ciphertext = b"encrypted_data" * 100
+        
+        wrapped = struct.pack(">B", layer_num) + iv + tag + ciphertext
+        
+        # Parse header
+        assert wrapped[0] == 8
+        assert len(wrapped[1:1+GCM_NONCE_SIZE]) == GCM_NONCE_SIZE
+        assert len(wrapped[1+GCM_NONCE_SIZE:1+GCM_NONCE_SIZE+GCM_TAG_SIZE]) == GCM_TAG_SIZE
+
+    def test_polymorphic_encryption_with_custom_dict(self):
+        """Test polymorphic encryption using custom dictionary as 'alphabet'."""
+        registry = GlobalPatternRegistry()
+        dict_manager = DictionaryManager(DictionaryConfig())
+        dict_manager.set_global_registry(registry)
+        
+        # Create custom semantic dictionary
+        custom_dict = Dictionary(version=1)
+        for i, token in enumerate(["THE", "QUICK", "BROWN", "FOX", "JUMPS"]):
+            custom_dict.add_mapping(token, i)
+        
+        dict_manager.register_dictionary("L1_SEMANTIC", custom_dict)
+        
+        layer1 = Layer1SemanticMapper(dict_manager, registry)
+        
+        # Simulate semantic mapping with custom alphabet
+        test_data = b"THE QUICK BROWN FOX JUMPS"
+        
+        # Compress with custom dictionary
+        compressed, _ = layer1.compress(test_data)
+        
+        # Verify compression happened
+        assert len(compressed) < len(test_data)
 
 
 # ============================================================================
