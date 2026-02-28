@@ -272,23 +272,49 @@ class StructuralTokenizer:
     
     def _handle_angle_bracket(self) -> None:
         """Handle < and related tag structures."""
-        if self.pos + 1 < len(self.data):
-            next_char = self.data[self.pos + 1]
+        # Check for closing tag
+        if self.pos + 1 < len(self.data) and self.data[self.pos + 1] == '/':
+            self.pos += 2
+            tag_start = self.pos
             
-            # Closing tag: </
-            if next_char == '/':
-                self.pos += 2
-                self._extract_tag_name()
-                self.nesting_stack.pop() if self.nesting_stack else None
-                
-                # Consume >
-                if self.pos < len(self.data) and self.data[self.pos] == '>':
-                    self.pos += 1
-                return
+            # Extract closing tag name
+            while self.pos < len(self.data) and self.data[self.pos] not in {'>', ' ', '\t', '\n'}:
+                self.pos += 1
+            
+            tag_name = self.data[tag_start:self.pos]
+            if tag_name:
+                self.tokens.append(StructuralToken(
+                    pattern=StructuralPattern.CLOSING_TAG,
+                    value=tag_name,
+                    nesting_level=len(self.nesting_stack),
+                    raw_position=self.pos-len(tag_name)
+                ))
+            
+            # Pop from nesting
+            if self.nesting_stack and self.nesting_stack[-1] == '<':
+                self.nesting_stack.pop()
+            
+            # Consume >
+            if self.pos < len(self.data) and self.data[self.pos] == '>':
+                self.pos += 1
+            return
         
         # Opening tag: <
         self.pos += 1
-        self._extract_tag_name()
+        tag_start = self.pos
+        
+        # Extract tag name
+        while self.pos < len(self.data) and self.data[self.pos] not in {'>', ' ', '\t', '\n', '/'}:
+            self.pos += 1
+        
+        tag_name = self.data[tag_start:self.pos]
+        if tag_name:
+            self.tokens.append(StructuralToken(
+                pattern=StructuralPattern.OPENING_TAG,
+                value=tag_name,
+                nesting_level=len(self.nesting_stack),
+                raw_position=tag_start-1
+            ))
         
         # Check for self-closing
         if self.pos + 1 < len(self.data) and self.data[self.pos:self.pos+2] == '/>':
@@ -303,22 +329,6 @@ class StructuralTokenizer:
             if self.pos < len(self.data) and self.data[self.pos] == '>':
                 self.pos += 1
             self.nesting_stack.append('<')
-    
-    def _extract_tag_name(self) -> None:
-        """Extract tag name from current position."""
-        start_pos = self.pos
-        
-        while self.pos < len(self.data) and self.data[self.pos] not in {'>', ' ', '\t', '\n'}:
-            self.pos += 1
-        
-        tag_name = self.data[start_pos:self.pos]
-        if tag_name:
-            self.tokens.append(StructuralToken(
-                pattern=StructuralPattern.OPENING_TAG,
-                value=tag_name,
-                nesting_level=len(self.nesting_stack),
-                raw_position=start_pos
-            ))
     
     def _handle_text_content(self) -> None:
         """Handle text content (not special characters)."""
@@ -351,6 +361,7 @@ class StructuralTokenizer:
                 nesting_level=len(self.nesting_stack),
                 raw_position=start_pos
             ))
+
 
 
 # ============================================================================
@@ -526,20 +537,39 @@ class Layer2Encoder:
         
         for token in tokens:
             # Encode pattern byte
-            output.write(bytes([token.pattern.value]))
+            output.write(bytes([int(token.pattern)]))
+            
+            # Encode nesting level for opening/closing tags
+            if token.pattern in {
+                StructuralPattern.OPENING_TAG,
+                StructuralPattern.CLOSING_TAG,
+                StructuralPattern.ATTRIBUTE,
+                StructuralPattern.NUMERIC_BLOCK,
+                StructuralPattern.QUOTE_PAIR
+            }:
+                # Encode nesting level (1 byte)
+                output.write(bytes([token.nesting_level & 0xFF]))
             
             # Encode value if present
             if token.value is not None:
-                # For patterns with values, store dictionary reference if available
-                pattern_id = self.dictionary.add_pattern(token.value)
-                if pattern_id is not None:
-                    # Encode as 2-byte dictionary ID
-                    output.write(struct.pack('<H', pattern_id))
+                encoded_value = token.value.encode('utf-8')
+                
+                # Try to add to dictionary
+                dict_id = self.dictionary.add_pattern(token.value)
+                
+                if dict_id is not None:
+                    # Use dictionary reference (2 bytes)
+                    output.write(struct.pack('<H', dict_id))
                 else:
-                    # Fallback: encode as length-prefixed string
-                    encoded_value = token.value.encode('utf-8')
-                    output.write(struct.pack('<H', len(encoded_value)))
-                    output.write(encoded_value)
+                    # Encode as length-prefixed string (fallback)
+                    if len(encoded_value) <= 255:
+                        output.write(bytes([len(encoded_value)]))
+                        output.write(encoded_value)
+                    else:
+                        # For longer strings, use 2-byte length
+                        output.write(bytes([0xFF]))  # Marker for 2-byte length
+                        output.write(struct.pack('<H', len(encoded_value)))
+                        output.write(encoded_value)
         
         return output.getvalue()
 
@@ -579,25 +609,63 @@ class Layer2Decoder:
             if not pattern_byte:
                 break
             
-            pattern = StructuralPattern(pattern_byte[0])
+            try:
+                pattern = StructuralPattern(int.from_bytes(pattern_byte, 'little'))
+            except ValueError:
+                break
             
-            # Reconstruct output based on pattern
             if pattern == StructuralPattern.EOF:
                 break
-            elif pattern in {
+            
+            # Read nesting level for patterns that have it
+            nesting_level = 0
+            if pattern in {
+                StructuralPattern.OPENING_TAG,
+                StructuralPattern.CLOSING_TAG,
+                StructuralPattern.ATTRIBUTE,
+                StructuralPattern.NUMERIC_BLOCK,
+                StructuralPattern.QUOTE_PAIR
+            }:
+                nesting_byte = input_stream.read(1)
+                if nesting_byte:
+                    nesting_level = int.from_bytes(nesting_byte, 'little')
+            
+            # Reconstruct output based on pattern
+            if pattern in {
                 StructuralPattern.QUOTE_PAIR,
                 StructuralPattern.OPENING_TAG,
-                StructuralPattern.ATTRIBUTE
+                StructuralPattern.CLOSING_TAG,
+                StructuralPattern.ATTRIBUTE,
+                StructuralPattern.NUMERIC_BLOCK
             }:
-                # Read dictionary ID
+                # Read dictionary ID or string data
                 dict_id_bytes = input_stream.read(2)
                 if len(dict_id_bytes) == 2:
                     dict_id = struct.unpack('<H', dict_id_bytes)[0]
-                    value = self.dictionary.id_to_pattern.get(dict_id, "")
-                    output.write(value.encode('utf-8'))
+                    
+                    # Check if this is a valid dictionary ID
+                    if dict_id in self.dictionary.id_to_pattern:
+                        value = self.dictionary.id_to_pattern[dict_id]
+                        output.write(value.encode('utf-8'))
+                    else:
+                        # This might be a length-prefixed string
+                        # Re-interpret the first byte as length
+                        first_byte = dict_id & 0xFF
+                        if first_byte != 0xFF:
+                            # Single-byte length
+                            string_len = first_byte
+                            string_data = input_stream.read(string_len)
+                            output.write(string_data)
+                        else:
+                            # Two-byte length follows
+                            len_bytes = input_stream.read(2)
+                            if len(len_bytes) == 2:
+                                string_len = struct.unpack('<H', len_bytes)[0]
+                                string_data = input_stream.read(string_len)
+                                output.write(string_data)
             else:
                 # Output pattern character/symbol
-                output.write(bytes([pattern.value]))
+                output.write(bytes([int(pattern)]))
         
         return output.getvalue()
 

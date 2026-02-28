@@ -222,6 +222,11 @@ class StreamCompressor:
         buffer_data = self.block_buffer.getvalue()
         block_size = len(buffer_data)
         
+        if block_size == 0:
+            # Empty block - shouldn't happen but handle it
+            self.block_buffer = io.BytesIO()
+            return None
+        
         # Compress
         start_time = time.time()
         
@@ -247,7 +252,7 @@ class StreamCompressor:
             compression_time_ms=compress_time_ms
         )
         
-        # Compute checksum
+        # Compute checksum (SHA-256)
         import hashlib
         block.checksum = hashlib.sha256(block.compressed_data).digest()
         
@@ -256,13 +261,16 @@ class StreamCompressor:
         self.stats.total_input_bytes += block_size
         self.stats.total_compressed_bytes += len(compressed_data)
         self.stats.total_compression_time_ms += compress_time_ms
-        self.stats.average_block_latency_ms = (
-            self.stats.total_compression_time_ms / self.stats.total_blocks_processed
-        )
         
-        # Reset buffer
+        if self.stats.total_blocks_processed > 0:
+            self.stats.average_block_latency_ms = (
+                self.stats.total_compression_time_ms / self.stats.total_blocks_processed
+            )
+        
+        # Reset buffer and increment sequence
         self.block_buffer = io.BytesIO()
         self.sequence_number += 1
+        self._last_block_time = time.time()
         
         return block
     

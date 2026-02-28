@@ -20,10 +20,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Dict, Any, List
 import io
+import os
 
 import numpy as np
 
 from config import CompressionLayer
+from typing import Tuple
 
 
 # ============================================================================
@@ -664,6 +666,8 @@ class GPUBackendFactory:
             return GPUBackendType.CPU_FALLBACK
 
 
-import os
-from typing import Tuple
-
+if __name__ == "__main__":
+    print("GPU Backends Available:")
+    available = GPUAvailability.get_available_backends()
+    for backend_type in available:
+        print(f"  - {backend_type.value}")

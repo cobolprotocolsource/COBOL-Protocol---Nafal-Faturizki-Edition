@@ -334,7 +334,7 @@ class BitPackingEncoder:
         for value in values:
             value_int = int(value) & mask
             
-            # Add to buffer
+            # Add to buffer (LSB first)
             bit_buffer |= (value_int << buffer_bits)
             buffer_bits += bit_width
             
@@ -434,7 +434,7 @@ class BitPackingDecoder:
             elif chunk.bit_width == 64:
                 return np.frombuffer(data, dtype=np.uint64)
         
-        # Manual bit unpacking
+        # Manual bit unpacking for sub-byte widths
         values = []
         bit_buffer = 0
         buffer_bits = 0
@@ -443,17 +443,20 @@ class BitPackingDecoder:
         mask = (1 << chunk.bit_width) - 1
         
         while len(values) < chunk.value_count:
-            if buffer_bits < chunk.bit_width:
-                if byte_pos < len(data):
-                    bit_buffer |= (data[byte_pos] << buffer_bits)
-                    buffer_bits += 8
-                    byte_pos += 1
-                else:
-                    break
+            # Fill buffer with bytes as needed
+            while buffer_bits < chunk.bit_width and byte_pos < len(data):
+                bit_buffer |= (data[byte_pos] << buffer_bits)
+                buffer_bits += 8
+                byte_pos += 1
             
-            values.append(bit_buffer & mask)
-            bit_buffer >>= chunk.bit_width
-            buffer_bits -= chunk.bit_width
+            # Extract value
+            if buffer_bits >= chunk.bit_width:
+                values.append(bit_buffer & mask)
+                bit_buffer >>= chunk.bit_width
+                buffer_bits -= chunk.bit_width
+            else:
+                # Not enough bits left
+                break
         
         return np.array(values, dtype=np.int64)
     

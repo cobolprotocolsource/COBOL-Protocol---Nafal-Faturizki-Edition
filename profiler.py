@@ -232,10 +232,17 @@ class CompressionProfiler:
             throughput_mbps=0.0
         )
         
-        if layer not in self.profile.layer_profiles:
-            self.profile.layer_profiles[layer] = profile
-        
+        self.profile.layer_profiles[layer] = profile
         self._layer_stack[layer] = time.time()
+        
+        # Track memory at start
+        try:
+            import psutil
+            process = psutil.Process()
+            mem_info = process.memory_info()
+            profile.memory_allocated_mb = mem_info.rss / (1024 * 1024)
+        except ImportError:
+            pass
     
     def end_layer(self, layer: CompressionLayer, input_size: int, output_size: int) -> None:
         """Mark end of layer processing."""
@@ -243,15 +250,26 @@ class CompressionProfiler:
             return
         
         end_time = time.time()
-        start_time = self._layer_stack[layer]
+        start_time = self._layer_stack.pop(layer)
         
-        if layer in self.profile.layer_profiles:
-            profile = self.profile.layer_profiles[layer]
+        profile = self.profile.layer_profiles.get(layer)
+        if profile:
             profile.end_time = end_time
             profile.duration_ms = (end_time - start_time) * 1000
             profile.input_size = input_size
             profile.output_size = output_size
             profile.compute_metrics()
+            
+            # Track peak memory
+            try:
+                import psutil
+                process = psutil.Process()
+                mem_info = process.memory_info()
+                mem_mb = mem_info.rss / (1024 * 1024)
+                profile.memory_peak_mb = max(profile.memory_peak_mb, mem_mb)
+                self.profile.peak_memory_mb = max(self.profile.peak_memory_mb, mem_mb)
+            except ImportError:
+                pass
     
     def record_dictionary_access(self, layer: CompressionLayer, 
                                  hit: bool, lookups: int = 1) -> None:
